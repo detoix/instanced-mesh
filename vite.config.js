@@ -8,7 +8,8 @@ export default defineConfig(({ command }) => ({
   publicDir: command === 'build' ? false : 'public',
   resolve: {
     alias: {
-      '@three.ez/instanced-mesh': resolve(__dirname, 'src/index.ts')
+      '@detoix/instanced-mesh/webgpu': resolve(__dirname, 'src/index.webgpu.ts'),
+      '@detoix/instanced-mesh': resolve(__dirname, 'src/index.ts')
     }
   },
   build: {

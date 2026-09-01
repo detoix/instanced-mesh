@@ -137,8 +137,12 @@ declare module '../InstancedMesh2.js' {
 InstancedMesh2.prototype.getObjectLODIndexForDistance = function (levels: LODLevel[], distance: number): number {
   for (let i = levels.length - 1; i > 0; i--) {
     const level = levels[i];
-    const levelDistance = level.distance - (level.distance * level.hysteresis);
-    if (distance >= levelDistance) return i;
+    // `level.distance` and the supplied distance are squared. Hysteresis is a
+    // fraction of the original linear threshold, so apply it before squaring:
+    // (d * (1 - h))^2 = d^2 * (1 - h)^2.
+    const hysteresisFactor = 1 - level.hysteresis;
+    const levelDistanceSquared = level.distance * hysteresisFactor * hysteresisFactor;
+    if (distance >= levelDistanceSquared) return i;
   }
 
   return 0;

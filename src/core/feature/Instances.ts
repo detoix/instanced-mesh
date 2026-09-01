@@ -196,6 +196,8 @@ InstancedMesh2.prototype.clearInstances = function () {
   this._instancesCount = 0;
   this._instancesArrayCount = 0;
   this._freeIds.length = 0;
+  this.count = 0;
+  this._indexArrayNeedsUpdate = true;
 
   this.bvh?.clear();
 

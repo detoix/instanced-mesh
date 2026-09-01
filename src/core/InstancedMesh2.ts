@@ -1,5 +1,5 @@
 import { AttachedBindMode, BindMode, Box3, BufferAttribute, BufferGeometry, Camera, Color, ColorManagement, ColorRepresentation, DataTexture, DetachedBindMode, InstancedBufferAttribute, Material, Matrix4, Mesh, Object3D, Object3DEventMap, Scene, Skeleton, Sphere, TypedArray, Vector3, WebGLProgramParametersWithUniforms, WebGLRenderer } from 'three';
-import { CustomSortCallback, OnFrustumEnterCallback } from './feature/FrustumCulling.js';
+import { CustomSortCallback, OnFrustumEnterCallback, ResolveLODIndexCallback } from './feature/FrustumCulling.js';
 import { Entity } from './feature/Instances.js';
 import { LODInfo } from './feature/LOD.js';
 import { InstancedEntity } from './InstancedEntity.js';
@@ -176,6 +176,11 @@ export class InstancedMesh2<
    * Callback function called if an instance is inside the frustum.
    */
   public onFrustumEnter: OnFrustumEnterCallback = null;
+  /**
+   * Optional final LOD selector for each visible instance. It receives the distance-selected level and can return
+   * another valid index in the active main or shadow LOD list. Invalid return values fall back to the computed index.
+   */
+  public resolveLODIndex: ResolveLODIndexCallback = null;
   /** @internal */ _renderer: WebGLRenderer = null;
   /** @internal */ _instancesCount = 0;
   /** @internal */ _instancesArrayCount = 0;
@@ -192,7 +197,7 @@ export class InstancedMesh2<
   protected _currentMaterial: Material = null;
   protected _customProgramCacheKeyBase: () => string = null;
   protected _onBeforeCompileBase: (parameters: WebGLProgramParametersWithUniforms, renderer: WebGLRenderer) => void = null;
-  protected _definesBase: { [key: string]: any } = null;
+  protected _definesBase: Record<string, unknown> = null;
   protected _freeIds: number[] = [];
   protected _createEntities: boolean;
 
@@ -210,6 +215,13 @@ export class InstancedMesh2<
    * The number of active instances.
    */
   public get instancesCount(): number { return this._instancesCount; }
+
+  /**
+   * Returns the visible-index buffer used by the requested render pass.
+   * The WebGPU backend overrides this to keep persistent color and shadow bindings separate.
+   * @internal
+   */
+  public getInstanceIndexForPass(_isShadowPass = false): typeof this.instanceIndex { return this.instanceIndex; }
 
   /**
    * Determines if per-instance frustum culling is enabled.
@@ -242,9 +254,10 @@ export class InstancedMesh2<
   }
 
   /** @internal */
-  // eslint-disable-next-line @typescript-eslint/unified-signatures
+  /* eslint-disable @typescript-eslint/unified-signatures -- the parent-LOD overload is internal */
   constructor(geometry: TGeometry, material: TMaterial, params?: InstancedMesh2Params, LOD?: InstancedMesh2);
   constructor(geometry: TGeometry, material: TMaterial, params?: InstancedMesh2Params);
+  /* eslint-enable @typescript-eslint/unified-signatures */
   /**
    * @remarks Geometry cannot be shared. If reused, it will be cloned.
    * @param geometry An instance of `BufferGeometry`.
@@ -282,7 +295,7 @@ export class InstancedMesh2<
 
     const frame = renderer.info.render.frame;
     if (this.instanceIndex && this.autoUpdate && !this.frustumCullingAlreadyPerformed(frame, camera, shadowCamera)) {
-      this.performFrustumCulling(shadowCamera, camera);
+      this.performFrustumCulling(shadowCamera, camera, true);
     }
 
     if (this.count === 0) return;
@@ -809,6 +822,7 @@ export class InstancedMesh2<
   public override copy(source: InstancedMesh2, recursive?: boolean): this {
     super.copy(source, recursive);
 
+    this.resolveLODIndex = source.resolveLODIndex;
     this.count = source._capacity;
     this._instancesCount = source._instancesCount;
     this._instancesArrayCount = source._instancesArrayCount;
@@ -879,10 +893,3 @@ const _sphere = new Sphere();
 const _tempMat4 = new Matrix4();
 const _tempCol = new Color();
 const _position = new Vector3();
-
-/** @internal */
-declare module 'three' {
-  interface Material {
-    defines: { [key: string]: any };
-  }
-}

@@ -1,15 +1,24 @@
 {
-  "name": "@three.ez/instanced-mesh",
-  "version": "0.3.14",
-  "description": "Enhanced InstancedMesh with frustum culling, fast raycasting (using BVH), sorting, visibility management and more.",
+  "name": "@detoix/instanced-mesh",
+  "version": "0.3.16-webgpu.0",
+  "description": "Enhanced InstancedMesh with frustum culling, fast raycasting (using BVH), sorting, visibility management and WebGL/WebGPU backends.",
   "author": "Andrea Gargaro <devgargaro@gmail.com>",
   "license": "MIT",
   "type": "module",
   "module": "build/index.js",
   "main": "build/index.cjs",
   "types": "src/index.d.ts",
-  "homepage": "https://agargaro.github.io/instanced-mesh",
-  "repository": "https://github.com/three-ez/instanced-mesh",
+  "homepage": "https://github.com/detoix/instanced-mesh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/detoix/instanced-mesh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/detoix/instanced-mesh/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "import": {
@@ -20,6 +29,10 @@
         "types": "./src/index.d.ts",
         "default": "./build/index.cjs"
       }
+    },
+    "./webgpu": {
+      "types": "./src/index.webgpu.d.ts",
+      "import": "./build/webgpu.js"
     }
   },
   "keywords": [
@@ -42,9 +55,9 @@
   ],
   "scripts": {
     "start": "vite",
-    "build": "vite build && tsc --build tsconfig.build.json",
+    "build": "vite build && vite build --config vite.webgpu.config.js && tsc --build tsconfig.build.json",
     "lint": "eslint --fix",
-    "test": "echo todo add tests",
+    "test": "npm run build && node --test test/*.test.mjs",
     "publish-alpha": "npm version prerelease --preid=alpha --git-tag-version false && npm run build && cd dist && npm publish --access public",
     "publish-patch": "npm version patch --git-tag-version false && npm run build && cd dist && npm publish --access public",
     "publish-minor": "npm version minor --git-tag-version false && npm run build && cd dist && npm publish --access public",
@@ -54,10 +67,11 @@
     "@eslint/js": "^9.39.1",
     "@stylistic/eslint-plugin": "^5.6.1",
     "@three.ez/main": "^0.5.11",
-    "@types/three": "^0.181.0",
+    "@types/three": "0.185.0",
     "eslint": "^9.39.1",
     "meshoptimizer": "^0.25.0",
     "simplex-noise": "^4.0.3",
+    "three": "0.185.0",
     "three-hex-tiling": "^0.1.5",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.48.1",
@@ -67,7 +81,7 @@
     "vite-plugin-static-copy": "^3.1.4"
   },
   "peerDependencies": {
-    "three": ">=0.159.0"
+    "three": ">=0.185.0 <0.186.0"
   },
   "dependencies": {
     "bvh.js": "^0.0.13"

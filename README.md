@@ -9,9 +9,9 @@
   <img src="public/banner.png" alt="banner" /> <br>
 
   [![Discord](https://img.shields.io/badge/chat-discord-blue?style=flat&logo=discord)](https://discord.gg/MVTwrdX3JM)
-  [![npm](https://img.shields.io/npm/v/@three.ez/instanced-mesh)](https://www.npmjs.com/package/@three.ez/instanced-mesh)
-  [![Stars](https://badgen.net/github/stars/three-ez/instanced-mesh)](https://github.com/three-ez/instanced-mesh)
-  [![BundlePhobia](https://badgen.net/bundlephobia/min/@three.ez/instanced-mesh)](https://bundlephobia.com/package/@three.ez/instanced-mesh)
+  [![npm](https://img.shields.io/npm/v/@detoix/instanced-mesh)](https://www.npmjs.com/package/@detoix/instanced-mesh)
+  [![Stars](https://badgen.net/github/stars/detoix/instanced-mesh)](https://github.com/detoix/instanced-mesh)
+  [![BundlePhobia](https://badgen.net/bundlephobia/min/@detoix/instanced-mesh)](https://bundlephobia.com/package/@detoix/instanced-mesh)
   [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=agargaro_instanced-mesh&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=agargaro_instanced-mesh)
   [![DeepScan grade](https://deepscan.io/api/teams/21196/projects/27990/branches/896898/badge/grade.svg)](https://deepscan.io/dashboard#view=project&tid=21196&pid=27990&bid=896898)
 
@@ -80,8 +80,68 @@ The documentation is available [here](https://agargaro.github.io/instanced-mesh)
 You can install it via npm using the following command:
 
 ```bash
-npm install @three.ez/instanced-mesh
+npm install @detoix/instanced-mesh
 ```
+
+### WebGPU backend
+
+The default package entry remains the WebGL implementation. Applications
+using Three.js r185's `WebGPURenderer` must opt into the separate entry:
+
+```ts
+import {
+  InstancedMesh2,
+  setWebGPUInstancePositionNode
+} from '@detoix/instanced-mesh/webgpu';
+import { BoxGeometry, MeshStandardMaterial, WebGPURenderer } from 'three/webgpu';
+import { float, vec3 } from 'three/tsl';
+
+const renderer = new WebGPURenderer();
+await renderer.init();
+
+const mesh = new InstancedMesh2(
+  new BoxGeometry(),
+  setWebGPUInstancePositionNode(
+    new MeshStandardMaterial(),
+    ({ positionNode, instanceId, instanceMatrix }) => {
+      // Local deformation runs before the resolved per-instance matrix. The
+      // stable id and matrix can seed deterministic world-space motion.
+      const lift = float(instanceId).mul(0.01);
+      return positionNode.add(vec3(0, lift, 0));
+    }
+  ),
+  { capacity: 100_000 }
+);
+```
+
+This backend preserves stable instance ids, dynamic capacity, visibility,
+CPU frustum culling, BVH, raycasting, LOD, shadow LOD, colors and opacity. It
+keeps matrices and colors in persistent storage buffers and uploads only
+coalesced dirty ranges. The compact visible-index buffer is separate, so
+culling and LOD can reorder draws without copying instance payloads.
+
+`setWebGPUInstancePositionNode(material, factory)` is the WebGPU-only extension
+point for instance-aware TSL deformation. Its factory receives the source
+material's local `positionNode` (or Three's `positionLocal`), `normalNode`, the
+stable-id-resolved `instanceMatrix`, stable `instanceId`, compact
+`drawInstanceIndex`, and geometry. Return a local-space TSL `vec3`; the backend
+applies its storage-buffer instance matrix afterwards. The backend captures the
+factory before cloning the source material and rebuilds it for capacity growth,
+render LODs and shadow LODs. Because the result is the mesh material's
+`positionNode`, Three's WebGPU shadow/depth passes use the same deformation.
+Attach the factory before constructing the mesh (or before assigning a new
+source to `mesh.material`); pass `null` to remove it from a source material.
+Source `colorNode`, `normalNode`, and `positionNode` values are preserved
+explicitly across the backend-owned clone.
+
+The WebGPU entry requires one shared Three.js `0.185.x` runtime. ShaderMaterial,
+per-instance custom uniforms, instanced skinning, per-instance morph targets,
+and clone/copy are rejected with explicit errors until they have native TSL
+implementations. GLSL `onBeforeCompile` customizations are rejected too; use
+NodeMaterial/TSL for custom WebGPU shaders. Materials are cloned per mesh so
+two meshes can never bind each other's storage buffers. Mutate `mesh.material`
+after construction, or assign a replacement to `mesh.material`; later changes
+to the caller-owned source material are intentionally not mirrored.
 
 Or you can import it from CDN:
 
@@ -91,7 +151,7 @@ Or you can import it from CDN:
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three/examples/jsm/",
-    "@three.ez/instanced-mesh": "https://cdn.jsdelivr.net/npm/@three.ez/instanced-mesh/build/index.js",
+    "@detoix/instanced-mesh": "https://cdn.jsdelivr.net/npm/@detoix/instanced-mesh/build/index.js",
     "bvh.js": "https://cdn.jsdelivr.net/npm/bvh.js/build/index.js"
   }
 }
@@ -155,7 +215,7 @@ It's possible to improve sort performance adding a `customSort`, like built-in `
 By default `sortObjects` is `false`. <br>
 
 ```ts
-import { createRadixSort } from '@three.ez/instanced-mesh';
+import { createRadixSort } from '@detoix/instanced-mesh';
 
 myInstancedMesh.sortObjects = true;
 myInstancedMesh.customSort = createRadixSort(myInstancedMesh);
