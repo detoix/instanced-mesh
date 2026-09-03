@@ -52,12 +52,15 @@ InstancedMesh2.prototype.raycastInstances = function (raycaster, result) {
     _sphere.copy(this.boundingSphere);
     if (!raycaster.ray.intersectsSphere(_sphere)) return;
 
-    const instancesToCheck = this.instanceIndex.array; // TODO this is unsorted and it's slower to iterate. If raycastFrustum is false, don't use it.
-    const raycastFrustum = this.raycastOnlyFrustum && this._perObjectFrustumCulled;
+    // The visible prefix is only worth following when the CPU maintains it.
+    // A GPU-driven backend leaves `instanceIndex` untouched and `count` an
+    // upper bound, so following it there would test the wrong instances.
+    const raycastFrustum = this.raycastOnlyFrustum && this._perObjectFrustumCulled && this.usesCPUVisibleList();
+    const instancesToCheck = raycastFrustum ? this.instanceIndex.array : null;
     const checkCount = raycastFrustum ? this.count : this._instancesArrayCount;
 
     for (let i = 0; i < checkCount; i++) {
-      this.checkObjectIntersection(raycaster, instancesToCheck[i], result);
+      this.checkObjectIntersection(raycaster, instancesToCheck === null ? i : instancesToCheck[i], result);
     }
   }
 };

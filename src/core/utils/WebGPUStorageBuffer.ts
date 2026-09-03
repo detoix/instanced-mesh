@@ -1,4 +1,4 @@
-import { StorageBufferAttribute, type WebGPURenderer } from 'three/webgpu';
+import { IndirectStorageBufferAttribute, StorageBufferAttribute, type WebGPURenderer } from 'three/webgpu';
 
 /**
  * Minimal image-shaped view used by {@link WebGPUFloatStorageBuffer}.
@@ -13,17 +13,17 @@ export interface WebGPUStorageBufferImage {
   readonly height: number;
 }
 
+type StorageArray = Float32Array | Uint32Array;
+
 /**
- * CPU-backed float storage buffer with one contiguous dirty range.
+ * CPU-backed storage buffer with one contiguous dirty range.
  *
- * The buffer is suitable for matrices (`itemSize = 16`) and colors
- * (`itemSize = 4`). Calls to `enqueueUpdate()` only widen the pending range;
- * they never create one update range per instance.
+ * Calls to `enqueueUpdate()` only widen the pending range; they never create
+ * one update range per instance.
  */
-export class WebGPUFloatStorageBuffer {
-  public _data: Float32Array;
+abstract class WebGPUStorageBuffer<TArray extends StorageArray> {
+  public _data: TArray;
   public attribute: StorageBufferAttribute;
-  public readonly image: WebGPUStorageBufferImage;
   public readonly itemSize: number;
   /** Increments whenever `attribute` is replaced. */
   public revision = 0;
@@ -31,14 +31,13 @@ export class WebGPUFloatStorageBuffer {
   private _dirtyStart = Infinity;
   private _dirtyEnd = 0;
 
-  public constructor(itemSize: number, capacity: number, name = '') {
+  public constructor(itemSize: number, capacity: number, name: string) {
     assertPositiveInteger(itemSize, 'itemSize');
     assertNonNegativeInteger(capacity, 'capacity');
 
     this.itemSize = itemSize;
-    this._data = new Float32Array(capacity * itemSize);
+    this._data = this.allocate(capacity * itemSize);
     this.attribute = createStorageAttribute(this._data, itemSize, name);
-    this.image = this.createImageView();
   }
 
   /** Number of logical items currently allocated. */
@@ -114,9 +113,49 @@ export class WebGPUFloatStorageBuffer {
     assertNonNegativeInteger(capacity, 'capacity');
     if (capacity === this.capacity) return;
 
-    const data = new Float32Array(capacity * this.itemSize);
-    data.set(this._data.subarray(0, Math.min(this._data.length, data.length)));
+    const data = this.allocate(capacity * this.itemSize);
+    data.set(this._data.subarray(0, Math.min(this._data.length, data.length)) as any);
     this.replaceData(data);
+  }
+
+  public dispose(): void {
+    this.attribute.dispose();
+    this.attribute.clearUpdateRanges();
+    this.clearPendingRange();
+  }
+
+  protected abstract allocate(length: number): TArray;
+
+  protected replaceData(data: TArray): void {
+    if (data.length % this.itemSize !== 0) {
+      throw new RangeError(`Storage data length must be divisible by itemSize (${this.itemSize}).`);
+    }
+    if (data === this._data) return;
+
+    const previousAttribute = this.attribute;
+    this._data = data;
+    this.attribute = createStorageAttribute(data, this.itemSize, previousAttribute.name);
+    this.revision++;
+    this.clearPendingRange();
+    previousAttribute.dispose();
+  }
+
+  private clearPendingRange(): void {
+    this._dirtyStart = Infinity;
+    this._dirtyEnd = 0;
+  }
+}
+
+/**
+ * Float storage buffer, suitable for matrices (`itemSize = 16`) and colors
+ * (`itemSize = 4`).
+ */
+export class WebGPUFloatStorageBuffer extends WebGPUStorageBuffer<Float32Array> {
+  public readonly image: WebGPUStorageBufferImage;
+
+  public constructor(itemSize: number, capacity: number, name = '') {
+    super(itemSize, capacity, name);
+    this.image = this.createImageView();
   }
 
   public clone(): WebGPUFloatStorageBuffer {
@@ -125,10 +164,15 @@ export class WebGPUFloatStorageBuffer {
     return clone;
   }
 
-  public dispose(): void {
-    this.attribute.dispose();
-    this.attribute.clearUpdateRanges();
-    this.clearPendingRange();
+  protected override allocate(length: number): Float32Array {
+    return new Float32Array(length);
+  }
+
+  protected override replaceData(data: Float32Array): void {
+    if (!(data instanceof Float32Array)) {
+      throw new TypeError('WebGPUFloatStorageBuffer data must be a Float32Array.');
+    }
+    super.replaceData(data);
   }
 
   private createImageView(): WebGPUStorageBufferImage {
@@ -161,27 +205,136 @@ export class WebGPUFloatStorageBuffer {
 
     return image;
   }
+}
 
-  private replaceData(data: Float32Array): void {
-    if (!(data instanceof Float32Array)) {
-      throw new TypeError('WebGPUFloatStorageBuffer data must be a Float32Array.');
-    }
-    if (data.length % this.itemSize !== 0) {
-      throw new RangeError(`Storage data length must be divisible by itemSize (${this.itemSize}).`);
-    }
-    if (data === this._data) return;
+/** Bit 0 of an instance state word: the instance is visible. */
+export const INSTANCE_STATE_VISIBLE = 1;
+/** Bit 1 of an instance state word: the instance is active (not deleted). */
+export const INSTANCE_STATE_ACTIVE = 2;
+/** Bit offset of the render-pass LOD override field (0 means "no override"). */
+export const INSTANCE_STATE_RENDER_LOD_SHIFT = 8;
+/** Bit offset of the shadow-pass LOD override field (0 means "no override"). */
+export const INSTANCE_STATE_SHADOW_LOD_SHIFT = 16;
+/** Mask of one LOD override field. */
+export const INSTANCE_STATE_LOD_MASK = 0xff;
+
+/**
+ * One `u32` of GPU-readable per-instance state: the active and visible flags
+ * the CPU already tracks in `availabilityArray`, plus optional per-pass LOD
+ * overrides. See `docs/webgpu-architecture.md`.
+ */
+export class WebGPUInstanceStateBuffer extends WebGPUStorageBuffer<Uint32Array> {
+  public constructor(capacity: number, name = 'ezInstanceState') {
+    super(1, capacity, name);
+  }
+
+  public setFlag(index: number, flag: number, value: boolean): void {
+    const previous = this._data[index];
+    const next = value ? previous | flag : previous & ~flag;
+    if (next === previous) return;
+    this._data[index] = next;
+    this.enqueueUpdate(index);
+  }
+
+  public setFlags(index: number, mask: number, value: boolean): void {
+    const previous = this._data[index];
+    const next = value ? previous | mask : previous & ~mask;
+    if (next === previous) return;
+    this._data[index] = next;
+    this.enqueueUpdate(index);
+  }
+
+  /** `level < 0` clears the override and restores distance-based selection. */
+  public setLODOverride(index: number, level: number, shift: number): void {
+    const stored = level < 0 ? 0 : Math.min(level + 1, INSTANCE_STATE_LOD_MASK);
+    const previous = this._data[index];
+    const next = (previous & ~(INSTANCE_STATE_LOD_MASK << shift)) | (stored << shift);
+    if (next === previous) return;
+    this._data[index] = next;
+    this.enqueueUpdate(index);
+  }
+
+  public getLODOverride(index: number, shift: number): number {
+    return ((this._data[index] >>> shift) & INSTANCE_STATE_LOD_MASK) - 1;
+  }
+
+  protected override allocate(length: number): Uint32Array {
+    return new Uint32Array(length);
+  }
+}
+
+/** `u32` words in one indexed indirect draw command. */
+export const DRAW_COMMAND_WORDS = 5;
+/** Bytes in one indirect draw command slot. */
+export const DRAW_COMMAND_BYTES = DRAW_COMMAND_WORDS * Uint32Array.BYTES_PER_ELEMENT;
+
+/**
+ * Indirect draw commands whose `instanceCount` word is written by the culling
+ * compute pass rather than by the CPU.
+ *
+ * A single 5-word stride serves both layouts. WebGPU reads
+ * `(indexCount, instanceCount, firstIndex, baseVertex, firstInstance)` for an
+ * indexed draw and `(vertexCount, instanceCount, firstVertex, firstInstance)`
+ * for a non-indexed one, so word 1 is `instanceCount` either way and the
+ * shader never needs to know which geometry it is looking at.
+ */
+export class WebGPUIndirectDrawBuffer {
+  public attribute: IndirectStorageBufferAttribute;
+  /** Increments whenever `attribute` is replaced. */
+  public revision = 0;
+
+  private _data: Uint32Array;
+
+  public constructor(commandCount: number, name = 'ezIndirectDraws') {
+    assertPositiveInteger(commandCount, 'commandCount');
+    this._data = new Uint32Array(commandCount * DRAW_COMMAND_WORDS);
+    this.attribute = createIndirectAttribute(this._data, name);
+  }
+
+  public get commandCount(): number {
+    return this._data.length / DRAW_COMMAND_WORDS;
+  }
+
+  public byteOffset(command: number): number {
+    return command * DRAW_COMMAND_BYTES;
+  }
+
+  public setCommandCount(commandCount: number): void {
+    assertPositiveInteger(commandCount, 'commandCount');
+    if (commandCount === this.commandCount) return;
 
     const previousAttribute = this.attribute;
-    this._data = data;
-    this.attribute = createStorageAttribute(data, this.itemSize, previousAttribute.name);
+    this._data = new Uint32Array(commandCount * DRAW_COMMAND_WORDS);
+    this.attribute = createIndirectAttribute(this._data, previousAttribute.name);
     this.revision++;
-    this.clearPendingRange();
     previousAttribute.dispose();
   }
 
-  private clearPendingRange(): void {
-    this._dirtyStart = Infinity;
-    this._dirtyEnd = 0;
+  /**
+   * Writes the geometry-dependent words of one command. `instanceCount` is
+   * deliberately left at zero: the compute pass owns it, and re-uploading it
+   * would race with the counts already on the GPU.
+   *
+   * @returns `true` when the command actually changed.
+   */
+  public writeCommand(command: number, elementCount: number, firstElement: number, _indexed: boolean): boolean {
+    // The remaining words -- baseVertex and firstInstance when indexed,
+    // firstInstance when not -- are zero in both layouts.
+    const base = command * DRAW_COMMAND_WORDS;
+    const data = this._data;
+    if (data[base] === elementCount && data[base + 2] === firstElement) return false;
+
+    data[base] = elementCount;
+    data[base + 2] = firstElement;
+    return true;
+  }
+
+  public upload(): void {
+    this.attribute.needsUpdate = true;
+  }
+
+  public dispose(): void {
+    this.attribute.dispose();
   }
 }
 
@@ -190,7 +343,9 @@ export class WebGPUFloatStorageBuffer {
  *
  * Its `array`, `_needsUpdate`, and `update(renderer, count)` surface mirrors
  * the existing WebGL index attribute closely enough for the shared culling
- * and LOD code. Each update uploads one `[0, count)` range.
+ * and LOD code. Each update uploads one `[0, count)` range. On the GPU-driven
+ * path the same attribute is written by a compute shader instead and no CPU
+ * upload happens at all.
  */
 export class WebGPUVisibleIndexBuffer {
   public attribute: StorageBufferAttribute;
@@ -291,8 +446,20 @@ export class WebGPUVisibleIndexBuffer {
   }
 }
 
-function createStorageAttribute<TArray extends Float32Array | Uint32Array>(array: TArray, itemSize: number, name: string): StorageBufferAttribute {
+function createStorageAttribute<TArray extends StorageArray>(array: TArray, itemSize: number, name: string): StorageBufferAttribute {
   const attribute = new StorageBufferAttribute(array, itemSize);
+  attribute.name = name;
+  return attribute;
+}
+
+/**
+ * The attribute is declared one `u32` per item on purpose. A struct-typed
+ * storage binding whose array holds exactly one element is emitted by Three as
+ * a bare struct rather than a runtime-sized array, which the compute kernel
+ * then cannot index. Words are addressed explicitly instead.
+ */
+function createIndirectAttribute(array: Uint32Array, name: string): IndirectStorageBufferAttribute {
+  const attribute = new IndirectStorageBufferAttribute(array, 1);
   attribute.name = name;
   return attribute;
 }

@@ -115,10 +115,53 @@ const mesh = new InstancedMesh2(
 ```
 
 This backend preserves stable instance ids, dynamic capacity, visibility,
-CPU frustum culling, BVH, raycasting, LOD, shadow LOD, colors and opacity. It
-keeps matrices and colors in persistent storage buffers and uploads only
-coalesced dirty ranges. The compact visible-index buffer is separate, so
-culling and LOD can reorder draws without copying instance payloads.
+frustum culling, BVH, raycasting, LOD, shadow LOD, colors and opacity. It keeps
+matrices and colors in persistent storage buffers and uploads only coalesced
+dirty ranges. The compact visible-index buffer is separate, so culling and LOD
+can reorder draws without copying instance payloads.
+
+#### GPU-driven culling and LOD
+
+Per-instance frustum culling and LOD selection run in a TSL compute pass, and
+each level is drawn with `drawIndexedIndirect` from an instance count the GPU
+produced. Nothing has to be orchestrated by the application. The per-frame CPU
+cost stops depending on instance count: at one million instances one main-camera
+pass falls from ~46 ms of JavaScript to ~0.2 ms. Run `npm run bench` to
+reproduce that on your machine.
+
+```ts
+mesh.culling;            // 'auto' (default) | 'gpu' | 'cpu'
+mesh.gpuCullingActive;   // whether the GPU path is running right now
+
+// Force one instance onto a level instead of using the distance test. This is
+// the GPU-readable replacement for the `resolveLODIndex` callback.
+mesh.setLODOverrideAt(id, 2);
+mesh.setLODOverrideAt(id, 1, /* isShadowPass */ true);
+mesh.setLODOverrideAt(id, -1);           // back to distance selection
+
+// The exact per-level instance counts, read back from the indirect commands.
+// For statistics: it costs a GPU readback, so never call it every frame.
+const [near, far] = await mesh.getVisibleCountsAsync();
+```
+
+`'auto'` keeps the shared CPU path whenever a mesh uses something the GPU cannot
+express: `sortObjects`, `onFrustumEnter`, `resolveLODIndex`, a wireframe
+material, or more LOD levels than the device's storage-buffer budget allows
+(five, on a device reporting the default limit of eight). `'gpu'` behaves the
+same but warns once, naming the reason. `'cpu'` opts out entirely.
+
+**`count` changes meaning on the GPU path.** Because the draw count lives on the
+GPU, `mesh.count` becomes the number of active instances — an upper bound that
+keeps Three issuing the draw — rather than the number rendered last frame. Use
+`getVisibleCountsAsync()` for the real figure, or `culling: 'cpu'` to keep the
+old semantics. `renderer.info` over-reports instances and triangles for these
+meshes for the same reason.
+
+The BVH is unchanged and still accelerates `raycast()` and spatial queries; it
+is simply no longer in the render hot path when the GPU path is active.
+
+`docs/webgpu-architecture.md` records why each of these choices was made and
+what would justify revisiting it.
 
 `setWebGPUInstancePositionNode(material, factory)` is the WebGPU-only extension
 point for instance-aware TSL deformation. Its factory receives the source

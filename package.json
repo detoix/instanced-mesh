@@ -1,6 +1,6 @@
 {
   "name": "@detoix/instanced-mesh",
-  "version": "0.3.16-webgpu.0",
+  "version": "0.4.0-webgpu.0",
   "description": "Enhanced InstancedMesh with frustum culling, fast raycasting (using BVH), sorting, visibility management and WebGL/WebGPU backends.",
   "author": "Andrea Gargaro <devgargaro@gmail.com>",
   "license": "MIT",
@@ -61,7 +61,9 @@
     "publish-alpha": "npm version prerelease --preid=alpha --git-tag-version false && npm run build && cd dist && npm publish --access public",
     "publish-patch": "npm version patch --git-tag-version false && npm run build && cd dist && npm publish --access public",
     "publish-minor": "npm version minor --git-tag-version false && npm run build && cd dist && npm publish --access public",
-    "publish-major": "npm version major --git-tag-version false && npm run build && cd dist && npm publish --access public"
+    "publish-major": "npm version major --git-tag-version false && npm run build && cd dist && npm publish --access public",
+    "bench": "npm run build && node test/bench-culling.mjs",
+    "test:browser": "npm run build && vite build --config vite.test.config.js && node test/run-webgpu-browser.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

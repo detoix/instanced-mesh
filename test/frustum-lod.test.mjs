@@ -20,14 +20,15 @@ const webGPUCamera = ({ near = 0.1, far = 200 } = {}) => {
 };
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
-const createLODMesh = (geometry = new BoxGeometry(0.25, 0.25, 0.25)) => {
+const createLODMesh = (geometry = new BoxGeometry(0.25, 0.25, 0.25), culling = 'cpu') => {
   const sourceMaterials = [
     new MeshStandardMaterial({ color: 0x446622 }),
     new MeshStandardMaterial({ color: 0x224466 })
   ];
   const lodGeometry = geometry.clone();
   const mesh = new InstancedMesh2(geometry, sourceMaterials[0], {
-    capacity: 8
+    capacity: 8,
+    culling
   });
   mesh.addLOD(lodGeometry, sourceMaterials[1], 5);
   return { mesh, lodGeometry, sourceMaterials };
@@ -209,7 +210,7 @@ test('WebGPU shadow callbacks explicitly select shadow LODs when both camera arg
       return 1;
     };
 
-    const renderer = { info: { calls: 41 } };
+    const renderer = { info: { render: { calls: 41 } } };
     mesh.onBeforeShadow(
       renderer,
       mesh,
@@ -292,7 +293,7 @@ test('a main LOD child restores color counts when it renders before the parent a
   const { mesh } = fixture;
   const shadowGeometry = addShadowLevels(fixture);
   const camera = webGPUCamera();
-  const renderer = { info: { calls: 77 } };
+  const renderer = { info: { render: { calls: 77 } } };
 
   try {
     mesh.addInstances(1, (instance) => instance.position.set(0, 0, -2));

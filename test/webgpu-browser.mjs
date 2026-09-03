@@ -8,8 +8,10 @@ import {
   OrthographicCamera,
   PerspectiveCamera,
   PlaneGeometry,
+  Group,
   RenderTarget,
   Scene,
+  Vector3,
   WebGPURenderer
 } from 'three/webgpu';
 import { float, vec3 } from 'three/tsl';
@@ -25,7 +27,8 @@ const result = {
   error: null,
   validationError: null,
   singleInstanceBindings: null,
-  shadowDeformation: null
+  shadowDeformation: null,
+  gpuDriven: null
 };
 window.__webgpuResult = result;
 
@@ -270,6 +273,266 @@ try {
   shadowGroundGeometry.dispose();
   shadowGroundMaterial.dispose();
   shadowTarget.dispose();
+
+  // GPU-driven culling. Every figure below is read back out of the indirect
+  // draw commands the compute pass wrote, so it is evidence that the kernel
+  // ran and that the draw consumed its result -- not that the CPU agreed with
+  // itself. See docs/webgpu-architecture.md.
+  const gpuScene = new Scene();
+  gpuScene.background = new Color(0x101418);
+  const gpuCamera = new PerspectiveCamera(60, 1, 0.1, 100);
+  gpuCamera.position.set(0, 0, 12);
+  gpuCamera.lookAt(0, 0, 0);
+  gpuCamera.updateMatrixWorld(true);
+  gpuScene.add(new AmbientLight(0xffffff, 1.5));
+
+  const gpuGeometry = new BoxGeometry(0.4, 0.4, 0.4);
+  const gpuMaterial = new MeshStandardMaterial({ color: 0xffcc44 });
+  const gpuMesh = new InstancedMesh2(gpuGeometry, gpuMaterial, { capacity: 64, culling: 'gpu' });
+  // Object-level culling would skip the draw entirely and leave the previous
+  // frame's counts in the indirect buffer, which is not what is under test.
+  gpuMesh.frustumCulled = false;
+  // A 8x8 sheet at z = 0, comfortably inside the frustum.
+  gpuMesh.addInstances(64, (instance, index) => {
+    instance.position.set((index % 8) - 3.5, Math.floor(index / 8) - 3.5, 0);
+  });
+  gpuScene.add(gpuMesh);
+
+  const gpuTarget = new RenderTarget(96, 96, { depthBuffer: true });
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
+  const renderGpuScene = async (frames = 2) => {
+    renderer.setRenderTarget(gpuTarget);
+    for (let frame = 0; frame < frames; frame++) {
+      renderer.render(gpuScene, gpuCamera);
+      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    renderer.setRenderTarget(null);
+  };
+
+  const gpuDriven = { active: gpuMesh.gpuCullingActive };
+
+  await renderGpuScene();
+  gpuDriven.allVisible = (await gpuMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  // Hidden instances must not survive compaction.
+  for (let index = 0; index < 64; index += 2) gpuMesh.setVisibilityAt(index, false);
+  await renderGpuScene();
+  gpuDriven.halfHidden = (await gpuMesh.getVisibleCountsAsync())?.[0] ?? null;
+  for (let index = 0; index < 64; index += 2) gpuMesh.setVisibilityAt(index, true);
+
+  // Removed instances must not survive either, and their slots must come back.
+  gpuMesh.removeInstances(0, 1, 2, 3);
+  await renderGpuScene();
+  gpuDriven.afterRemove = (await gpuMesh.getVisibleCountsAsync())?.[0] ?? null;
+  gpuMesh.addInstances(4, (instance, id) => {
+    instance.position.set((id % 8) - 3.5, Math.floor(id / 8) - 3.5, 0);
+  });
+  await renderGpuScene();
+  gpuDriven.afterReadd = (await gpuMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  // Turning the camera away must empty the visible list entirely.
+  gpuCamera.position.set(0, 0, 12);
+  gpuCamera.lookAt(0, 0, 40);
+  gpuCamera.updateMatrixWorld(true);
+  await renderGpuScene();
+  gpuDriven.noneVisible = (await gpuMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  // A camera that keeps only the right-hand columns must keep a strict subset.
+  gpuCamera.position.set(3.6, 0, 3);
+  gpuCamera.lookAt(3.6, 0, 0);
+  gpuCamera.updateMatrixWorld(true);
+  await renderGpuScene();
+  gpuDriven.partiallyVisible = (await gpuMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  gpuCamera.position.set(0, 0, 12);
+  gpuCamera.lookAt(0, 0, 0);
+  gpuCamera.updateMatrixWorld(true);
+  await renderGpuScene();
+  const gpuPixels = await (async () => {
+    renderer.setRenderTarget(gpuTarget);
+    renderer.render(gpuScene, gpuCamera);
+    const pixels = await renderer.readRenderTargetPixelsAsync(gpuTarget, 0, 0, 96, 96);
+    renderer.setRenderTarget(null);
+    return pixels;
+  })();
+  let litPixels = 0;
+  for (let offset = 0; offset < gpuPixels.length; offset += 4) {
+    if (gpuPixels[offset] > 90 && gpuPixels[offset + 1] > 60) litPixels++;
+  }
+  gpuDriven.litPixels = litPixels;
+
+  gpuMesh.dispose();
+  gpuGeometry.dispose();
+  gpuMaterial.dispose();
+
+  // A material array draws one indirect command per geometry group. Without
+  // the count-publish kernel only the first group would receive a non-zero
+  // instance count, so the second material's color would never appear.
+  const multiGeometry = new BoxGeometry(3, 3, 3);
+  multiGeometry.clearGroups();
+  multiGeometry.addGroup(0, 18, 0);
+  multiGeometry.addGroup(18, 18, 1);
+  const multiMaterials = [
+    new MeshBasicMaterial({ color: 0xff0000 }),
+    new MeshBasicMaterial({ color: 0x0000ff })
+  ];
+  const multiMesh = new InstancedMesh2(multiGeometry, multiMaterials, { capacity: 2, culling: 'gpu' });
+  multiMesh.frustumCulled = false;
+  // BoxGeometry's first group owns +X/-X/+Y and its second owns -Y/+Z/-Z. Yaw
+  // the boxes so one face of each group is turned towards the camera.
+  multiMesh.addInstances(2, (instance, index) => {
+    instance.position.set(index * 4 - 2, 0, 0);
+    instance.quaternion.setFromAxisAngle(new Vector3(0, 1, 0), Math.PI / 5);
+  });
+  gpuScene.add(multiMesh);
+  await renderGpuScene(3);
+
+  renderer.setRenderTarget(gpuTarget);
+  renderer.render(gpuScene, gpuCamera);
+  const multiPixels = await renderer.readRenderTargetPixelsAsync(gpuTarget, 0, 0, 96, 96);
+  renderer.setRenderTarget(null);
+  let redOnly = 0;
+  let blueOnly = 0;
+  for (let offset = 0; offset < multiPixels.length; offset += 4) {
+    const red = multiPixels[offset];
+    const green = multiPixels[offset + 1];
+    const blue = multiPixels[offset + 2];
+    if (red > 100 && green < 60 && blue < 60) redOnly++;
+    if (blue > 100 && green < 60 && red < 60) blueOnly++;
+  }
+  gpuDriven.multiMaterial = { redOnly, blueOnly };
+  gpuScene.remove(multiMesh);
+  multiMesh.dispose();
+  multiGeometry.dispose();
+  for (const material of multiMaterials) material.dispose();
+
+  // A transformed parent. The kernel tests object-space planes against the
+  // instance matrices, so a mesh whose matrixWorld is not identity -- the
+  // ordinary case for a mesh inside a scene graph -- must still cull exactly.
+  const worldScene = new Scene();
+  worldScene.background = new Color(0x101418);
+  worldScene.add(new AmbientLight(0xffffff, 1.5));
+  const worldGroup = new Group();
+  worldGroup.position.set(120, -40, 60);
+  worldGroup.rotation.set(0.3, Math.PI / 3, -0.2);
+  worldGroup.scale.setScalar(2.5);
+  worldScene.add(worldGroup);
+
+  const worldGeometry = new BoxGeometry(0.3, 0.3, 0.3);
+  const worldMaterial = new MeshBasicMaterial({ color: 0x66ff99 });
+  const worldMesh = new InstancedMesh2(worldGeometry, worldMaterial, { capacity: 16, culling: 'gpu' });
+  worldMesh.frustumCulled = false;
+  // A line of instances along the group's local X axis.
+  worldMesh.addInstances(16, (instance, index) => instance.position.set(index - 7.5, 0, 0));
+  worldGroup.add(worldMesh);
+  worldScene.updateMatrixWorld(true);
+
+  const worldCamera = new PerspectiveCamera(60, 1, 0.1, 400);
+  const worldTarget = new RenderTarget(64, 64, { depthBuffer: true });
+  const localPoint = new Vector3();
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
+  const aimWorldCamera = (localX, backOff) => {
+    localPoint.set(localX, 0, 0).applyMatrix4(worldGroup.matrixWorld);
+    worldCamera.position.copy(localPoint).add(new Vector3(0, 0, backOff));
+    worldCamera.lookAt(localPoint);
+    worldCamera.updateMatrixWorld(true);
+  };
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
+  const renderWorldScene = async () => {
+    renderer.setRenderTarget(worldTarget);
+    for (let frame = 0; frame < 2; frame++) {
+      renderer.render(worldScene, worldCamera);
+      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    renderer.setRenderTarget(null);
+  };
+
+  aimWorldCamera(0, 90);
+  await renderWorldScene();
+  gpuDriven.transformedAll = (await worldMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  aimWorldCamera(0, 4);
+  await renderWorldScene();
+  gpuDriven.transformedNear = (await worldMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  worldCamera.position.copy(localPoint).add(new Vector3(0, 0, 60));
+  worldCamera.lookAt(localPoint.clone().add(new Vector3(0, 0, 400)));
+  worldCamera.updateMatrixWorld(true);
+  await renderWorldScene();
+  gpuDriven.transformedNone = (await worldMesh.getVisibleCountsAsync())?.[0] ?? null;
+
+  worldMesh.dispose();
+  worldGeometry.dispose();
+  worldMaterial.dispose();
+  worldTarget.dispose();
+
+  // LOD classification and an independent shadow pass, both GPU-side.
+  const lodScene = new Scene();
+  lodScene.background = new Color(0x101418);
+  lodScene.add(new AmbientLight(0xffffff, 1.2));
+  const lodSun = new DirectionalLight(0xffffff, 2);
+  lodSun.position.set(0, 12, 0);
+  lodSun.castShadow = true;
+  lodSun.shadow.mapSize.set(256, 256);
+  // Deliberately narrow: the far row of instances falls outside it, so the
+  // shadow pass has to reach a different visible set from the main camera.
+  lodSun.shadow.camera.left = -20;
+  lodSun.shadow.camera.right = 20;
+  lodSun.shadow.camera.top = 20;
+  lodSun.shadow.camera.bottom = -20;
+  lodSun.shadow.camera.far = 40;
+  lodScene.add(lodSun, lodSun.target);
+
+  const nearGeometry = new BoxGeometry(0.5, 0.5, 0.5);
+  const farGeometry = new BoxGeometry(0.5, 0.5, 0.5);
+  const lodMesh = new InstancedMesh2(
+    nearGeometry,
+    new MeshStandardMaterial({ color: 0x88ccff }),
+    { capacity: 16, culling: 'gpu' }
+  );
+  lodMesh.addLOD(farGeometry, new MeshStandardMaterial({ color: 0xff8844 }), 10);
+  lodMesh.castShadow = true;
+  lodMesh.frustumCulled = false;
+  // Eight instances within 10 units of the camera, eight well beyond it.
+  lodMesh.addInstances(16, (instance, index) => {
+    instance.position.set((index % 4) - 1.5, 0, index < 8 ? -2 : -30);
+  });
+  lodScene.add(lodMesh);
+
+  // Three only renders a shadow map when something actually receives it.
+  const lodGroundGeometry = new PlaneGeometry(120, 120);
+  const lodGroundMaterial = new MeshStandardMaterial({ color: 0x334455, roughness: 1 });
+  const lodGround = new (await import('three/webgpu')).Mesh(lodGroundGeometry, lodGroundMaterial);
+  lodGround.rotation.x = -Math.PI / 2;
+  lodGround.position.y = -1;
+  lodGround.receiveShadow = true;
+  lodScene.add(lodGround);
+
+  const lodCamera = new PerspectiveCamera(75, 1, 0.1, 200);
+  lodCamera.position.set(0, 0, 0);
+  lodCamera.lookAt(0, 0, -1);
+  lodCamera.updateMatrixWorld(true);
+
+  const lodTarget = new RenderTarget(96, 96, { depthBuffer: true });
+  renderer.setRenderTarget(lodTarget);
+  for (let frame = 0; frame < 3; frame++) {
+    renderer.render(lodScene, lodCamera);
+    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+  renderer.setRenderTarget(null);
+
+  gpuDriven.lodLevels = await lodMesh.getVisibleCountsAsync(false);
+  gpuDriven.shadowLevels = await lodMesh.getVisibleCountsAsync(true);
+
+  lodMesh.dispose();
+  nearGeometry.dispose();
+  farGeometry.dispose();
+  lodGroundGeometry.dispose();
+  lodGroundMaterial.dispose();
+  lodTarget.dispose();
+  gpuTarget.dispose();
+
+  result.gpuDriven = gpuDriven;
 
   const ground = new (await import('three/webgpu')).Mesh(
     new PlaneGeometry(70, 70),

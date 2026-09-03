@@ -224,6 +224,14 @@ export class InstancedMesh2<
   public getInstanceIndexForPass(_isShadowPass = false): typeof this.instanceIndex { return this.instanceIndex; }
 
   /**
+   * Whether `instanceIndex` holds a CPU-maintained visible prefix that
+   * `count` indexes into. False on a GPU-driven backend, where the compute
+   * pass owns the list and `count` is only an upper bound.
+   * @internal
+   */
+  public usesCPUVisibleList(): boolean { return true; }
+
+  /**
    * Determines if per-instance frustum culling is enabled.
    * @default true
    */

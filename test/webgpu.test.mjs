@@ -23,8 +23,8 @@ const WebGPUInstancedMesh2 = webgpuPackage.InstancedMesh2;
 const setWebGPUInstancePositionNode = webgpuPackage.setWebGPUInstancePositionNode;
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
-const createMesh = (capacity = 8, material = new MeshStandardMaterial()) =>
-  new WebGPUInstancedMesh2(new BoxGeometry(), material, { capacity });
+const createMesh = (capacity = 8, material = new MeshStandardMaterial(), culling = 'auto') =>
+  new WebGPUInstancedMesh2(new BoxGeometry(), material, { capacity, culling });
 
 const disposeCounter = (target) => {
   let count = 0;
@@ -190,7 +190,7 @@ test('instance-aware source position node API validates inputs and supports remo
 });
 
 test('WebGPU storage accepts a 100001 capacity and a visible prefix above 1000', () => {
-  const mesh = createMesh(100_001);
+  const mesh = createMesh(100_001, new MeshStandardMaterial(), 'cpu');
 
   assert.equal(mesh.capacity, 100_001);
   assert.equal(mesh.instanceIndex.array.length, 100_001);
@@ -234,7 +234,7 @@ test('WebGPU keeps per-object instancing cache identity without enabling Three n
 });
 
 test('add/remove reuses free ids and visibility produces a compact visible-index prefix', () => {
-  const mesh = createMesh();
+  const mesh = createMesh(8, new MeshStandardMaterial(), 'cpu');
   const camera = new PerspectiveCamera();
 
   mesh.addInstances(5, (instance, id) => instance.position.set(id, 0, 0));
