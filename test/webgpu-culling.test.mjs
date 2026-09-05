@@ -29,9 +29,48 @@ const createRendererStub = () => {
   return {
     state,
     info: { render: { get calls() { return state.calls; } } },
-    compute(nodes) { state.dispatches.push(nodes); }
+    compute(nodes) { state.dispatches.push(nodes); },
+    // Three frees a storage attribute's GPU buffer only through the private
+    // `_attributes.delete()`; `BufferAttribute.dispose()` just dispatches an
+    // event. Recording it here is what proves the buffer was actually returned.
+    _attributes: {
+      released: [],
+      delete(attribute) {
+        this.released.push(attribute);
+        return null;
+      }
+    }
   };
 };
+
+// Three counts an indirect attribute under `info.memory.indirectStorageAttributes`
+// and every other storage attribute under `.storageAttributes`, keyed off this
+// same flag (see Bindings.js). Splitting the released list the same way is what
+// keeps a leak in the indirect buffers from hiding behind a passing storage count.
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
+const releasedByKind = (renderer) => {
+  const released = renderer._attributes.released;
+  return {
+    storage: released.filter((attribute) => !attribute.isIndirectStorageBufferAttribute),
+    indirect: released.filter((attribute) => attribute.isIndirectStorageBufferAttribute)
+  };
+};
+
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
+const ownedAttributes = (mesh) => ({
+  storage: [
+    mesh.instanceIndex.attribute,
+    mesh.getInstanceIndexForPass(true).attribute,
+    mesh.matricesTexture.attribute,
+    mesh.colorsTexture.attribute,
+    mesh._instanceState.attribute
+  ],
+  indirect: mesh._cullPasses.filter(Boolean).map((pass) => pass.indirect.attribute)
+});
+
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
+const countReleases = (renderer, attribute) =>
+  renderer._attributes.released.filter((released) => released === attribute).length;
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
 const renderOnce = (mesh, renderer, camera, scene = new Scene()) => {
@@ -630,4 +669,96 @@ test('an instance state buffer rejects out-of-range writes', () => {
   assert.throws(() => state.enqueueUpdate(4), RangeError);
   assert.throws(() => state.flush(5), RangeError);
   state.dispose();
+});
+
+test('disposing a GPU-culled mesh releases every storage AND indirect attribute it owns, once', () => {
+  const renderer = createRendererStub();
+  const camera = new PerspectiveCamera();
+  const scene = new Scene();
+  const mesh = createMesh();
+
+  mesh.addInstances(4, (instance, id) => instance.position.set(id, 0, 0));
+  mesh.setColorAt(0, 0x336699);
+
+  // Both passes, so both culling passes and both indirect buffers exist.
+  renderOnce(mesh, renderer, camera, scene);
+  renderer.state.calls++;
+  mesh.onBeforeShadow(renderer, scene, camera, camera, mesh.geometry, mesh.material, null);
+  mesh.onAfterShadow(renderer, scene, camera, camera, mesh.geometry, mesh.material, null);
+
+  const owned = ownedAttributes(mesh);
+  assert.equal(owned.indirect.length, 2, 'a render and a shadow culling pass were built');
+  const all = [...owned.storage, ...owned.indirect];
+  assert.equal(new Set(all).size, all.length, 'every owned buffer has its own attribute');
+  assert.equal(renderer._attributes.released.length, 0, 'rendering releases nothing');
+
+  mesh.dispose();
+
+  const released = releasedByKind(renderer);
+  for (const attribute of owned.storage) {
+    assert.equal(countReleases(renderer, attribute), 1, `${attribute.name} is released exactly once`);
+  }
+  for (const attribute of owned.indirect) {
+    assert.equal(countReleases(renderer, attribute), 1, `indirect ${attribute.name} is released exactly once`);
+  }
+  assert.equal(released.storage.length, owned.storage.length, 'the storage count returns to baseline');
+  assert.equal(released.indirect.length, owned.indirect.length, 'the indirect count returns to baseline');
+
+  mesh.dispose();
+  assert.equal(renderer._attributes.released.length, all.length, 'a second dispose() releases nothing again');
+});
+
+test('a grow cycle releases the attributes it reallocates away from, storage and indirect alike', () => {
+  const renderer = createRendererStub();
+  const camera = new PerspectiveCamera();
+  const scene = new Scene();
+  const mesh = createMesh({ capacity: 2 });
+
+  mesh.addInstances(2, (instance, id) => instance.position.set(id, 0, 0));
+  mesh.setColorAt(0, 0x336699);
+  renderOnce(mesh, renderer, camera, scene);
+
+  const before = ownedAttributes(mesh);
+  assert.equal(before.indirect.length, 1);
+
+  // Growing reallocates every per-instance buffer; adding a level rebuilds the
+  // culling graph, which reallocates the indirect commands.
+  mesh.resizeBuffers(16);
+  mesh.addLOD(new BoxGeometry(0.5, 0.5, 0.5), new MeshStandardMaterial(), 12);
+  renderer.state.calls++;
+  renderOnce(mesh, renderer, camera, scene);
+
+  const after = ownedAttributes(mesh);
+  for (const attribute of before.storage) {
+    assert.equal(countReleases(renderer, attribute), 1, `the replaced ${attribute.name} is released once`);
+    assert.equal(after.storage.includes(attribute), false, 'the mesh moved to a fresh attribute');
+  }
+  assert.equal(
+    releasedByKind(renderer).indirect.length,
+    1,
+    'the reallocated indirect commands are released, so the indirect count does not climb'
+  );
+  assert.equal(before.indirect.includes(after.indirect[0]), false);
+
+  mesh.dispose();
+
+  const released = releasedByKind(renderer);
+  assert.equal(
+    released.storage.length,
+    before.storage.length + after.storage.length + 2,
+    'every storage generation is released exactly once (+2 for the LOD level indexes)'
+  );
+  assert.equal(
+    released.indirect.length,
+    before.indirect.length + after.indirect.length,
+    'every indirect generation is released exactly once'
+  );
+});
+
+test('a GPU-culled mesh disposed before it was ever rendered has no renderer to release through', () => {
+  const mesh = createMesh();
+  mesh.addInstances(1);
+  mesh.setColorAt(0, 0x336699);
+
+  assert.doesNotThrow(() => mesh.dispose());
 });

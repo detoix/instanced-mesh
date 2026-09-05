@@ -16,6 +16,14 @@ export interface WebGPUStorageBufferImage {
 type StorageArray = Float32Array | Uint32Array;
 
 /**
+ * Called with every storage attribute a buffer stops using.
+ *
+ * `BufferAttribute.dispose()` frees no GPU memory on its own, so the owner of a
+ * buffer installs one of these to release the attribute through its renderer.
+ */
+export type StorageAttributeRelease = (attribute: StorageBufferAttribute) => void;
+
+/**
  * CPU-backed storage buffer with one contiguous dirty range.
  *
  * Calls to `enqueueUpdate()` only widen the pending range; they never create
@@ -27,6 +35,11 @@ abstract class WebGPUStorageBuffer<TArray extends StorageArray> {
   public readonly itemSize: number;
   /** Increments whenever `attribute` is replaced. */
   public revision = 0;
+  /**
+   * Installed by the owning mesh so every attribute this buffer drops — on
+   * dispose and on each reallocation — also releases its GPU buffer.
+   */
+  public onReleaseAttribute: StorageAttributeRelease | null = null;
 
   private _dirtyStart = Infinity;
   private _dirtyEnd = 0;
@@ -119,8 +132,7 @@ abstract class WebGPUStorageBuffer<TArray extends StorageArray> {
   }
 
   public dispose(): void {
-    this.attribute.dispose();
-    this.attribute.clearUpdateRanges();
+    releaseAttribute(this.attribute, this.onReleaseAttribute);
     this.clearPendingRange();
   }
 
@@ -137,7 +149,7 @@ abstract class WebGPUStorageBuffer<TArray extends StorageArray> {
     this.attribute = createStorageAttribute(data, this.itemSize, previousAttribute.name);
     this.revision++;
     this.clearPendingRange();
-    previousAttribute.dispose();
+    releaseAttribute(previousAttribute, this.onReleaseAttribute);
   }
 
   private clearPendingRange(): void {
@@ -282,6 +294,13 @@ export class WebGPUIndirectDrawBuffer {
   public attribute: IndirectStorageBufferAttribute;
   /** Increments whenever `attribute` is replaced. */
   public revision = 0;
+  /**
+   * Installed by the owning culling pass so every attribute this buffer drops —
+   * on dispose and on each reallocation — also releases its GPU buffer. Indirect
+   * attributes are counted separately by three, under
+   * `info.memory.indirectStorageAttributes`.
+   */
+  public onReleaseAttribute: StorageAttributeRelease | null = null;
 
   private _data: Uint32Array;
 
@@ -307,7 +326,7 @@ export class WebGPUIndirectDrawBuffer {
     this._data = new Uint32Array(commandCount * DRAW_COMMAND_WORDS);
     this.attribute = createIndirectAttribute(this._data, previousAttribute.name);
     this.revision++;
-    previousAttribute.dispose();
+    releaseAttribute(previousAttribute, this.onReleaseAttribute);
   }
 
   /**
@@ -334,7 +353,7 @@ export class WebGPUIndirectDrawBuffer {
   }
 
   public dispose(): void {
-    this.attribute.dispose();
+    releaseAttribute(this.attribute, this.onReleaseAttribute);
   }
 }
 
@@ -352,6 +371,11 @@ export class WebGPUVisibleIndexBuffer {
   public _needsUpdate = true;
   /** Increments whenever `attribute` is replaced. */
   public revision = 0;
+  /**
+   * Installed by the owning mesh so every attribute this buffer drops — on
+   * dispose and on each reallocation — also releases its GPU buffer.
+   */
+  public onReleaseAttribute: StorageAttributeRelease | null = null;
 
   private _array: Uint32Array;
 
@@ -422,8 +446,7 @@ export class WebGPUVisibleIndexBuffer {
   }
 
   public dispose(): void {
-    this.attribute.dispose();
-    this.attribute.clearUpdateRanges();
+    releaseAttribute(this.attribute, this.onReleaseAttribute);
     this._needsUpdate = false;
   }
 
@@ -442,8 +465,20 @@ export class WebGPUVisibleIndexBuffer {
     this.attribute = createStorageAttribute(array, 1, previousAttribute.name);
     this._needsUpdate = true;
     this.revision++;
-    previousAttribute.dispose();
+    releaseAttribute(previousAttribute, this.onReleaseAttribute);
   }
+}
+
+/**
+ * Retires an attribute that is no longer in use.
+ *
+ * `dispose()` is kept for consumers listening for the event, but it frees
+ * nothing by itself; `onRelease` is what actually returns the GPU buffer.
+ */
+function releaseAttribute(attribute: StorageBufferAttribute, onRelease: StorageAttributeRelease | null): void {
+  attribute.dispose();
+  attribute.clearUpdateRanges();
+  onRelease?.(attribute);
 }
 
 function createStorageAttribute<TArray extends StorageArray>(array: TArray, itemSize: number, name: string): StorageBufferAttribute {

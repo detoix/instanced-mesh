@@ -9,6 +9,7 @@ import {
   type Skeleton,
   MeshBasicNodeMaterial,
   Sphere,
+  type StorageBufferAttribute,
   type WebGPURenderer
 } from 'three/webgpu';
 import { InstancedMesh2, type InstancedMesh2Params } from './InstancedMesh2.js';
@@ -20,7 +21,8 @@ import {
   INSTANCE_STATE_VISIBLE,
   WebGPUFloatStorageBuffer,
   WebGPUInstanceStateBuffer,
-  WebGPUVisibleIndexBuffer
+  WebGPUVisibleIndexBuffer,
+  type StorageAttributeRelease
 } from './utils/WebGPUStorageBuffer.js';
 import {
   WebGPUCullingPass,
@@ -160,6 +162,7 @@ export class InstancedMesh2WebGPU<
   TEventMap extends Object3DEventMap = Object3DEventMap
 > extends InstancedMesh2<TData, TGeometry, TMaterial, TEventMap> {
   private declare _ownedWebGPUMaterials: NodeCompatibleMaterial[];
+  private declare _releaseStorageAttribute: StorageAttributeRelease;
   private declare _shadowInstanceIndex: WebGPUVisibleIndexBuffer;
   private declare _shadowPassDepth: number;
   private declare _webgpuBindingRevision: number;
@@ -228,6 +231,7 @@ export class InstancedMesh2WebGPU<
     this._gpuCullingRenderCall = -1;
     this._singleLevel = [{ distance: 0, hysteresis: 0, object: this as unknown as InstancedMesh2 }];
     this._lastRenderCamera = null;
+    this.bindStorageRelease();
     _webgpuMaterialStates.get(this).ready = true;
     this.installWebGPUMaterial(material);
   }
@@ -345,6 +349,7 @@ export class InstancedMesh2WebGPU<
     colors._data.fill(1);
     colors.enqueueFullUpdate();
     this.colorsTexture = colors as unknown as typeof this.colorsTexture;
+    this.bindStorageRelease();
     this.rebuildLODMaterialNodes();
   }
 
@@ -717,6 +722,7 @@ export class InstancedMesh2WebGPU<
       pass = new WebGPUCullingPass(isShadowPass ? 'ezShadowCulling' : 'ezCulling');
       this._cullPasses[index] = pass;
       this._cullNeedsRebuild[index] = true;
+      this.bindStorageRelease();
     }
 
     // Rebuilding regenerates the TSL graph and allocates new compute nodes,
@@ -823,6 +829,38 @@ export class InstancedMesh2WebGPU<
 
   private get webgpuOwner(): InstancedMesh2WebGPU {
     return (this._parentLOD as unknown as InstancedMesh2WebGPU) ?? this;
+  }
+
+  /**
+   * Points every storage buffer this mesh owns at the renderer release path.
+   *
+   * Safe to call repeatedly and before the subclass fields exist — `Mesh`'s
+   * constructor reaches `initIndexAttribute()` through `super()` — because the
+   * callback resolves the renderer lazily, at the moment an attribute is
+   * released rather than when it is installed. `_webgpuRenderer` is recorded on
+   * the LOD owner by `updatePass()`, so a level that was never drawn on its own
+   * still resolves the renderer that drew the mesh.
+   */
+  private bindStorageRelease(): void {
+    const release = this._releaseStorageAttribute ??= (attribute: StorageBufferAttribute): void => {
+      releaseStorageAttribute(this.webgpuOwner._webgpuRenderer ?? null, attribute);
+    };
+
+    this.indexStorage.onReleaseAttribute = release;
+    this.shadowIndexStorage.onReleaseAttribute = release;
+
+    // A LOD level shares the owner's matrix, color, instance-state and culling
+    // buffers -- `initMatricesTexture()` and `prepareCulling()` only ever build
+    // them on the owner, and only the owner's `dispose()` releases them -- so
+    // only the owner binds them.
+    if (this._parentLOD) return;
+
+    this.matrixStorage.onReleaseAttribute = release;
+    if (this.colorStorage) this.colorStorage.onReleaseAttribute = release;
+    this._instanceState.onReleaseAttribute = release;
+    for (const pass of this._cullPasses) {
+      if (pass) pass.indirect.onReleaseAttribute = release;
+    }
   }
 
   private get indexStorage(): WebGPUVisibleIndexBuffer {
@@ -996,6 +1034,34 @@ function lodOverrideShift(isShadowPass: boolean): number {
  * `info.render.calls` advances once per render or shadow-map pass and, unlike
  * `info.calls`, is not moved by the compute dispatches this backend issues.
  */
+/**
+ * Frees the GPU buffer backing a standalone storage attribute.
+ *
+ * `BufferAttribute.dispose()` only dispatches a `dispose` event; the buffer is
+ * actually freed by `Attributes.delete()`, which three calls from exactly one
+ * place — `Geometries.js`, for attributes owned by a `BufferGeometry`. Instance
+ * storage attributes and the culling passes' indirect draw buffers belong to no
+ * geometry, so nothing in three ever listens for their disposal and a disposed
+ * mesh keeps its whole instance storage until the renderer itself dies.
+ *
+ * `renderer._attributes` is private, and three exposes no public replacement:
+ * there is no `renderer.deleteAttribute()` or `releaseAttribute()`. This
+ * function is the only place in the codebase that reaches for it; if three ever
+ * adds a public API, replacing the body here is the whole migration.
+ *
+ * `renderer` is `null` when the mesh was disposed before it was ever rendered,
+ * in which case nothing was registered. `Attributes.delete()` is already a
+ * no-op for an attribute it does not know, so an attribute that was created but
+ * never uploaded needs no guard of its own.
+ */
+function releaseStorageAttribute(renderer: WebGPURenderer | null, attribute: StorageBufferAttribute): void {
+  const attributes = (renderer as unknown as {
+    _attributes?: { delete(attribute: StorageBufferAttribute): unknown };
+  } | null)?._attributes;
+
+  attributes?.delete(attribute);
+}
+
 function getRenderCall(renderer: WebGPURenderer): number {
   return renderer.info.render.calls;
 }
