@@ -57,16 +57,21 @@ const releasedByKind = (renderer) => {
 };
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
-const ownedAttributes = (mesh) => ({
-  storage: [
-    mesh.instanceIndex.attribute,
-    mesh.getInstanceIndexForPass(true).attribute,
-    mesh.matricesTexture.attribute,
-    mesh.colorsTexture.attribute,
-    mesh._instanceState.attribute
-  ],
-  indirect: mesh._cullPasses.filter(Boolean).map((pass) => pass.indirect.attribute)
-});
+const ownedAttributes = (mesh) => {
+  const levels = (mesh.LODinfo?.objects ?? []).filter((object) => object !== mesh);
+  return {
+    storage: [
+      mesh.instanceIndex.attribute,
+      mesh.getInstanceIndexForPass(true).attribute,
+      mesh.matricesTexture.attribute,
+      mesh.colorsTexture.attribute,
+      mesh._instanceState.attribute,
+      // A level owns its two indexes and shares everything else with the owner.
+      ...levels.flatMap((level) => [level.instanceIndex.attribute, level.getInstanceIndexForPass(true).attribute])
+    ],
+    indirect: mesh._cullPasses.filter(Boolean).map((pass) => pass.indirect.attribute)
+  };
+};
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- JavaScript test helper
 const countReleases = (renderer, attribute) =>
@@ -679,6 +684,7 @@ test('disposing a GPU-culled mesh releases every storage AND indirect attribute 
 
   mesh.addInstances(4, (instance, id) => instance.position.set(id, 0, 0));
   mesh.setColorAt(0, 0x336699);
+  mesh.addLOD(new BoxGeometry(0.5, 0.5, 0.5), new MeshStandardMaterial(), 12);
 
   // Both passes, so both culling passes and both indirect buffers exist.
   renderOnce(mesh, renderer, camera, scene);
@@ -687,10 +693,18 @@ test('disposing a GPU-culled mesh releases every storage AND indirect attribute 
   mesh.onAfterShadow(renderer, scene, camera, camera, mesh.geometry, mesh.material, null);
 
   const owned = ownedAttributes(mesh);
+  assert.equal(owned.storage.length, 7, 'the owner\'s five buffers plus the level\'s two indexes');
   assert.equal(owned.indirect.length, 2, 'a render and a shadow culling pass were built');
   const all = [...owned.storage, ...owned.indirect];
   assert.equal(new Set(all).size, all.length, 'every owned buffer has its own attribute');
-  assert.equal(renderer._attributes.released.length, 0, 'rendering releases nothing');
+  assert.equal(
+    releasedByKind(renderer).storage.length,
+    0,
+    'rendering never drops an instance buffer; only the culling rebuild reallocates, and only its indirect commands'
+  );
+  // Building the graph for two levels grew each pass's command buffer once, so
+  // the indirect baseline is whatever those rebuilds already returned.
+  const indirectBeforeDispose = releasedByKind(renderer).indirect.length;
 
   mesh.dispose();
 
@@ -702,10 +716,15 @@ test('disposing a GPU-culled mesh releases every storage AND indirect attribute 
     assert.equal(countReleases(renderer, attribute), 1, `indirect ${attribute.name} is released exactly once`);
   }
   assert.equal(released.storage.length, owned.storage.length, 'the storage count returns to baseline');
-  assert.equal(released.indirect.length, owned.indirect.length, 'the indirect count returns to baseline');
+  assert.equal(
+    released.indirect.length,
+    indirectBeforeDispose + owned.indirect.length,
+    'the indirect count returns to baseline'
+  );
 
+  const afterDispose = renderer._attributes.released.length;
   mesh.dispose();
-  assert.equal(renderer._attributes.released.length, all.length, 'a second dispose() releases nothing again');
+  assert.equal(renderer._attributes.released.length, afterDispose, 'a second dispose() releases nothing again');
 });
 
 test('a grow cycle releases the attributes it reallocates away from, storage and indirect alike', () => {
@@ -745,8 +764,8 @@ test('a grow cycle releases the attributes it reallocates away from, storage and
   const released = releasedByKind(renderer);
   assert.equal(
     released.storage.length,
-    before.storage.length + after.storage.length + 2,
-    'every storage generation is released exactly once (+2 for the LOD level indexes)'
+    before.storage.length + after.storage.length,
+    'every storage generation is released exactly once'
   );
   assert.equal(
     released.indirect.length,
