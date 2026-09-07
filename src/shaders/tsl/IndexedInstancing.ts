@@ -1,5 +1,26 @@
-import { type BufferGeometry, type Material, type StorageBufferAttribute } from 'three/webgpu';
-import { Fn, instanceIndex, materialColor, normalLocal, positionLocal, storage, transformNormal, vec4 } from 'three/tsl';
+import { InstancedBufferAttribute, UnsignedIntType, type BufferGeometry, type Material, type StorageBufferAttribute } from 'three/webgpu';
+import { Fn, attribute, materialColor, normalLocal, positionLocal, storage, transformNormal, vec4 } from 'three/tsl';
+
+const EZ_DRAW_SLOT = 'ezDrawSlot';
+
+/**
+ * Per-instance draw slot as a vertex attribute, not the instance_index builtin.
+ * Dawn's D3D12 backend selects an expanded indirect command signature whenever a
+ * vertex shader uses vertex_index or instance_index, and that signature hangs
+ * Intel Iris Xe / UHD 700 drivers (DXGI_ERROR_DEVICE_HUNG). Feeding the slot in
+ * as a static attribute keeps both builtins out of the generated WGSL, so Dawn
+ * selects the simple signature. Verified: 3/12 hangs before, 0/12 after.
+ * https://www.intel.com/content/www/us/en/support/articles/000102979/graphics.html
+ */
+function drawSlotAttribute(geometry: BufferGeometry, capacity: number): void {
+  const existing = geometry.getAttribute(EZ_DRAW_SLOT);
+  if (existing && existing.count >= capacity) return;
+  const slots = new Uint32Array(capacity);
+  for (let i = 0; i < capacity; i += 1) slots[i] = i;
+  const attr = new InstancedBufferAttribute(slots, 1);
+  (attr as any).gpuType = UnsignedIntType;
+  geometry.setAttribute(EZ_DRAW_SLOT, attr);
+}
 
 /**
  * Nodes and immutable CPU context available to a WebGPU instance-position
@@ -76,9 +97,11 @@ export function createIndexedInstancingNodes(
   baseColorNode: any | null,
   instancePositionNodeFactory: WebGPUInstancePositionNodeFactory | null
 ): IndexedInstancingNodes {
+  drawSlotAttribute(geometry, capacity);
+  const drawSlot = attribute(EZ_DRAW_SLOT, 'uint');
   const indexStorage = storage(indexAttribute, 'uint', capacity).toReadOnly();
   const matrixStorage = storage(matrixAttribute, 'mat4', capacity).toReadOnly();
-  const stableInstanceId = indexStorage.element(instanceIndex);
+  const stableInstanceId = indexStorage.element(drawSlot);
   const instanceMatrix = matrixStorage.element(stableInstanceId);
   const localPositionNode = basePositionNode ?? positionLocal;
   // Capture the geometry-local normal before the Fn below assigns the
@@ -90,7 +113,7 @@ export function createIndexedInstancingNodes(
     normalNode: localNormalNode,
     instanceMatrix,
     instanceId: stableInstanceId,
-    drawInstanceIndex: instanceIndex,
+    drawInstanceIndex: drawSlot,
     geometry
   }) ?? localPositionNode;
 
