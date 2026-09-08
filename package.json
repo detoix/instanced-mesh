@@ -1,6 +1,6 @@
 {
   "name": "@detoix/instanced-mesh",
-  "version": "0.4.0-webgpu.1",
+  "version": "0.4.0-webgpu.2",
   "description": "Enhanced InstancedMesh with frustum culling, fast raycasting (using BVH), sorting, visibility management and WebGL/WebGPU backends.",
   "author": "Andrea Gargaro <devgargaro@gmail.com>",
   "license": "MIT",
